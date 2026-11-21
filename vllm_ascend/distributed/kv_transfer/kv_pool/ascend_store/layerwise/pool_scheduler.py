@@ -78,6 +78,22 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
     def _process_hit_without_alloc(self, store_skip_tokens: int) -> bool:
         return store_skip_tokens > 0
 
+    def _uses_dsv4_layerwise_pool(self) -> bool:
+        return (
+            self.use_layerwise_transfer
+            and getattr(getattr(self, "kv_cache_config", None), "dsv4_cache_format", None) is not None
+        )
+
+    def _build_req_meta(self, request_tracker: RequestTracker, *args, **kwargs):
+        if (
+            self.layerwise_offload
+            and self._uses_dsv4_layerwise_pool()
+            and (entry := self._unfinished_requests.get(request_tracker.req_id))
+        ):
+            # Speculative verifier rows do not identify saveable input KV.
+            request_tracker.token_len = min(request_tracker.token_len, len(entry[0].all_token_ids))
+        return super()._build_req_meta(request_tracker, *args, **kwargs)
+
     def get_running_target_token_len(self, request: Request, num_new_tokens: int) -> int:
         target_token_len = request.num_computed_tokens + num_new_tokens
         if self.layerwise_offload:
@@ -125,8 +141,16 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             if self.use_eagle:
                 final_block_start = (request.num_tokens - 1) // self.lcm_block_size * self.lcm_block_size
                 token_len = min(token_len, final_block_start)
-                if token_len <= 0:
-                    return 0
+            elif (
+                self.layerwise_offload
+                and self._uses_dsv4_layerwise_pool()
+                and len(self.cacheable_group_ids) != len(self.original_block_size)
+            ):
+                # Probe the checkpoint used to resume, before the block
+                # containing the prompt token that must be replayed.
+                token_len = min(token_len, self._floor_to_cache_transfer_granularity(request.num_tokens - 1))
+            if token_len <= 0:
+                return 0
             return self._lookup_layerwise_with_coordinator(
                 request, token_len, 0 if self.layerwise_offload else num_computed_tokens
             )

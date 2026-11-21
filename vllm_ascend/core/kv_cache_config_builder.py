@@ -118,7 +118,12 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         if grouped_specs is not None and len(grouped_specs) >= 2:
             # A uniform spec is not a mixed-page-size layout; grouping it here
             # would drop the C128 bucket the shared-tuple layout depends on.
-            return _get_kv_cache_groups_uniform_groups(grouped_specs)
+            groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+            if _is_deepseek_v4_groups(groups):
+                from vllm_ascend.models.deepseek_v4.cache_transfer import record_pool_format
+
+                record_pool_format(vllm_config, groups)
+            return groups
 
         kimi_k3_groups = _get_kimi_k3_dspark_mixed_kv_cache_groups(kv_cache_spec)
         if kimi_k3_groups is not None:
@@ -589,6 +594,10 @@ def _attach_transfer_and_speculation_metadata(
         kv_cache_config.dspark_context_group_ids = resident_mla_context_group_ids(kv_cache_config.kv_cache_groups)
         kv_cache_config.dspark_draft_only_group_ids = draft_only_group_ids(kv_cache_config.kv_cache_groups)
     reuse_layout = plan_layerwise_cache_reuse(kv_cache_config, vllm_config)
+    if _is_deepseek_v4_groups(kv_cache_config.kv_cache_groups) and kv_transfer_config is not None:
+        from vllm_ascend.models.deepseek_v4.cache_transfer import bind_pool_format
+
+        bind_pool_format(kv_cache_config, vllm_config, rotating=reuse_layout is not None)
     if reuse_layout is not None:
         assert kv_transfer_config is not None
         # Core budgets these bytes and the scheduler uses the value to detect reuse.

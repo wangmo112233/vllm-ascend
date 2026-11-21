@@ -26,7 +26,10 @@ from .layerwise_cache_layout import (
 )
 
 SPEC_REUSE_RULES = MappingProxyType(
-    {"glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES"}
+    {
+        "glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES",
+        "deepseek_v4": "vllm_ascend.models.deepseek_v4.cache_reuse.get_spec_reuse_rules",
+    }
 )
 
 
@@ -36,7 +39,8 @@ def get_spec_reuse_rules(vllm_config: VllmConfig) -> SpecReuseRules | None:
     if not isinstance(model_type, str):
         return None
     path = SPEC_REUSE_RULES.get(model_type)
-    return resolve_obj_by_qualname(path) if path is not None else None
+    rules = resolve_obj_by_qualname(path) if path is not None else None
+    return rules() if callable(rules) else rules
 
 
 def get_layerwise_ascend_store_config(kv_transfer_config: Any) -> dict[str, Any] | None:

@@ -120,6 +120,36 @@ The following log confirms that buffer reuse is enabled:
 Layerwise KV cache reuse merged ... descriptors into ... descriptors using ... buffer assignments.
 ```
 
+### DeepSeek-V4 Flash and Pro with AscendStore
+
+DeepSeek-V4 Flash and Pro can rotate compressed history, indexer history, SWA, and compressor state through shared device buffers. AscendStore saves and restores those pages through the Memcache backend. The common planner retains the model's native cache groups and block IDs.
+
+
+For a single-instance deployment, pass the following as `--kv-transfer-config`.
+
+```json
+{
+  "kv_connector": "AscendStoreConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "backend": "memcache",
+    "use_layerwise": true,
+    "layerwise_num_shared_buffers": 3,
+    "layerwise_prefetch_layers": 2,
+    "layerwise_independent_layers": [0, 1]
+  }
+}
+```
+
+Omit `layerwise_num_shared_buffers` for a baseline with layerwise pooling and the native device layout. Independent layer IDs refer to the model's layer order. The value `"all"` keeps every layer resident. Use eager execution or `PIECEWISE` graphs for rotating caches.
+
+For P/D disaggregation, configure a producer `MultiConnector` with the layerwise `AscendStoreConnector` and `MooncakePushConnector`. Keep the Decode cache resident. Push starts while the source pages are valid and the store waits for the source read before reusing their slot. Use matching P/D cache formats and context-parallel sizes. MTP draft caches remain resident. Rotating Push producers require the shared-slot completion support in [#21891](https://github.com/vllm-project/vllm-ascend/pull/21891). The producer checks for that capability at startup. DSpark uses the post-write notification on this path. Layerwise AscendStore requests PIECEWISE through the standard graph configuration. Native TurboQuant KV transfer restrictions apply.
+
+
+Use a fresh pool when upgrading from the earlier experimental A5 indexer format. The layerwise Memcache format distinguishes compatible component layouts. A5 transfers each indexer data and scale page once. Resident and rotating runs can use the same public prefix identity when the logical cache format matches. A request's continuation snapshots are scoped to that request. Retained public checkpoints are independently available for other requests.
+
+One complete TTFT comparison uses the same model, topology, workload, and memory utilization for native and rotating layouts. Report actual block counts, HBM and external hit counters, and unprofiled TTFT. Single-instance Decode performs layerwise restores too, so report its TPOT separately.
+
 ## 3. Sparse KV Cache Offload on Decode
 
 Requirements and limitations:

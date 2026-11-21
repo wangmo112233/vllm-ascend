@@ -54,6 +54,19 @@ class GvaDataPlane(LayerwiseDataPlane):
 
     def __init__(self, worker: LayerwiseKVPoolWorker):
         self._worker = worker
+        self._prompt_window_policy = None
+        config = getattr(worker, "kv_cache_config", None)
+        if getattr(config, "dsv4_cache_format", None):
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
+                get_layerwise_reuse_layout,
+            )
+
+            layout = get_layerwise_reuse_layout(config)
+            if layout is None or not layout.has_layer_reuse:
+                return
+            from vllm_ascend.models.deepseek_v4.cache_transfer import apply_prompt_window_masks
+
+            self._prompt_window_policy = apply_prompt_window_masks
 
     def prepare_sessions(self, requests: list[ReqMeta]) -> dict[int, list[ReqMeta]]:
         """GVA opens no pool sessions; resolve the transfer targets instead.
@@ -63,8 +76,15 @@ class GvaDataPlane(LayerwiseDataPlane):
         step's snapshot, so it must complete before save allocation
         repoints the partial key at a fresh one.
         """
-        self._prepare_load_gvas(requests)
-        self._alloc_gvas_for_save(requests)
+        try:
+            self._prepare_load_gvas(requests)
+            self._alloc_gvas_for_save(requests)
+        except Exception:
+            # Binding aborted before this step could enqueue any DMA or reach its
+            # late draft callback. Return leases already acquired by earlier batches.
+            if self._worker.has_late_draft_loads:
+                self._worker.release_step_load_leases()
+            raise
         return {}
 
     def finish_sessions(self) -> None:
@@ -123,6 +143,11 @@ class GvaDataPlane(LayerwiseDataPlane):
                 continue
             block_hashes = request.block_hashes
 
+            public_pages = (
+                self._prompt_window_policy(worker, request, request.target_token_len, saving=True)
+                if self._prompt_window_policy
+                else {}
+            )
             all_group_gvas: list[np.ndarray] = []
             all_group_block_ids: list[np.ndarray] = []
             all_group_save_keys: list[str] = []
@@ -173,14 +198,19 @@ class GvaDataPlane(LayerwiseDataPlane):
                     for block_idx in range(save_start_block, end_limit)
                     if group_store_mask is None or block_idx >= len(group_store_mask) or group_store_mask[block_idx]
                 ]
+                window_public = public_pages.get(group_id)
+                is_public = [
+                    block < len(group_block_hashes) and (window_public is None or window_public[block])
+                    for block in candidate_blocks
+                ]
                 candidate_keys = [
                     worker._make_layerwise_full_key(
                         group_id,
                         block_hash_to_str(group_block_hashes[block_idx]),
                     )
-                    if block_idx < len(group_block_hashes)
+                    if public
                     else worker._make_layerwise_partial_key(request, group_id, block_idx, request.target_token_len)
-                    for block_idx in candidate_blocks
+                    for block_idx, public in zip(candidate_blocks, is_public, strict=True)
                 ]
                 partial_key = None
                 if (
@@ -188,18 +218,19 @@ class GvaDataPlane(LayerwiseDataPlane):
                     and partial_block_index is not None
                     and partial_block_index < len(block_ids_by_group)
                 ):
+                    if window_public is not None and block_ids_by_group[partial_block_index] == 0:
+                        raise ValueError("Partial window snapshot has no physical block")
                     partial_key = worker._make_layerwise_partial_key(
                         request, group_id, partial_block_index, request.target_token_len
                     )
                 if worker.layerwise_offload:
                     pages = worker._snapshot_keys.setdefault(request.req_id, {}).setdefault(group_id, {})
-                    for block_idx, key in zip(candidate_blocks, candidate_keys):
-                        if block_idx < len(group_block_hashes):
+                    for block_idx, key, public in zip(candidate_blocks, candidate_keys, is_public, strict=True):
+                        if public:
                             pages.pop(block_idx, None)
                         else:
                             pages[block_idx] = key
                     if partial_key is not None:
-                        assert partial_block_index is not None
                         pages[partial_block_index] = partial_key
                 if not save_owner:
                     all_group_gvas.append(np.zeros(len(block_ids_by_group), dtype=np.int64))
@@ -350,6 +381,8 @@ class GvaDataPlane(LayerwiseDataPlane):
             all_group_load_keys: list[str] = []
             partial_load_gvas = [0] * worker.num_kv_cache_groups
             restore_previous_step = worker.layerwise_offload and request.load_spec.layerwise_previous_step
+            if restore_previous_step and self._prompt_window_policy:
+                self._prompt_window_policy(worker, request, cached_tokens, saving=False)
             for group_id in range(worker.num_kv_cache_groups):
                 if group_id not in worker.cacheable_group_ids:
                     all_group_load_gvas.append(np.zeros(0, dtype=np.int64))
@@ -366,7 +399,13 @@ class GvaDataPlane(LayerwiseDataPlane):
                 get_saved_key = None
                 partial_block_index = None
                 if restore_previous_step:
-                    snapshot = worker._get_layerwise_load_snapshot(request, group_id, cached_tokens, group_block_hashes)
+                    snapshot = worker._get_layerwise_load_snapshot(
+                        request,
+                        group_id,
+                        cached_tokens,
+                        group_block_hashes,
+                        prefer_private=self._prompt_window_policy is not None,
+                    )
                     if snapshot is None:
                         all_group_load_gvas.append(np.zeros(0, dtype=np.int64))
                         continue
@@ -399,7 +438,9 @@ class GvaDataPlane(LayerwiseDataPlane):
                 full_len = len(block_ids_by_group)
 
                 if partial_block_index is not None and (
-                    partial_block_index < load_start_block or partial_block_index >= full_len
+                    partial_block_index < load_start_block
+                    or partial_block_index >= full_len
+                    or (self._prompt_window_policy is not None and block_ids_by_group[partial_block_index] == 0)
                 ):
                     return False
 
